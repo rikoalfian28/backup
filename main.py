@@ -1,6 +1,6 @@
 import os
-import json
 import random
+import json
 from datetime import datetime
 from typing import Optional
 
@@ -16,20 +16,72 @@ from telegram.ext import (
 )
 
 # === CONFIG ===
-TOKEN = os.getenv("BOT_TOKEN")  # set your bot token in environment
-ADMIN_ID = 7894393728
-BACKUP_FILE = "backup_anon_semarang.json"
-SAWERIA_LINK = "https://saweria.co/operasional"
+# GANTI ADMIN_ID DAN SAWERIA_LINK DENGAN MILIK ANDA.
+# TOKEN diambil dari Railway Environment Variable.
+ADMIN_IDS = [7894393728]  # GANTI DENGAN USER ID ADMIN-MU
+SAWERIA_LINK = "https://saweria.co/operasional" 
+SAWERIA_MESSAGE = (
+    "Terima kasih sudah menggunakan Anonymous Chat!\n"
+    "Jika bot ini bermanfaat, kamu bisa mendukung operasional server di link berikut:"
+)
+
+# === DATA PERSISTENCE CONFIG ===
+DATA_FILE = "bot_data_final.json" 
 
 # === STATES ===
-GENDER, AGE = range(2)
+# HANYA GENDER DAN AGE, UNIVERSITAS DIHILANGKAN
+GENDER, AGE = range(2) 
 
 # === In-memory storage ===
-users = {}
-chat_logs = {}
+users = {} # user_id -> dict with keys: verified, partner, gender, age, searching, banned
+chat_logs = {} # user_id -> list of (sender_label, message) up to last 20
 
 # ---------------------------
-# Helpers
+# Data Persistence (Backup/Restore)
+# ---------------------------
+def save_data():
+    """Save all data (users and chat_logs) to a JSON file."""
+    data_to_save = {
+        "users": users,
+        "chat_logs": chat_logs,
+    }
+    with open(DATA_FILE, "w") as f:
+        json.dump(data_to_save, f, indent=4)
+    print(f"🤖 Data saved to {DATA_FILE} at {datetime.now().strftime('%H:%M:%S')}")
+
+def load_data():
+    """Load data (users and chat_logs) from a JSON file on startup."""
+    global users, chat_logs
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            try:
+                data_loaded = json.load(f)
+                users.update({int(k): v for k, v in data_loaded.get("users", {}).items()})
+                chat_logs.update({int(k): v for k, v in data_loaded.get("chat_logs", {}).items()})
+                print(f"🤖 Data loaded from {DATA_FILE}. Total users: {len(users)}")
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Error loading data from {DATA_FILE}: {e}. Starting with empty data.")
+    else:
+        print("⚠️ Data file not found. Starting with empty data.")
+
+async def auto_backup(context: ContextTypes.DEFAULT_TYPE):
+    """Job to periodically save data and send backup file to admins."""
+    save_data() 
+    backup_file_path = DATA_FILE
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            with open(backup_file_path, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id=admin_id,
+                    document=f, 
+                    caption=f"🗄️ Auto Backup Data ({datetime.now().strftime('%d/%m %H:%M:%S')})\nFile ini berisi status users (termasuk verifikasi) dan log chat."
+                )
+        except Exception as e:
+            print(f"ERROR sending backup file to admin {admin_id}: {e}")
+
+# ---------------------------
+# Helper utilities (General)
 # ---------------------------
 async def safe_reply(update: Update, text: str, parse_mode=None, reply_markup=None):
     if getattr(update, "message", None):
@@ -41,9 +93,9 @@ async def safe_reply(update: Update, text: str, parse_mode=None, reply_markup=No
         else:
             return await cq.answer(text)
 
-def ensure_user(uid: int):
-    if uid not in users:
-        users[uid] = {
+def ensure_user(user_id: int):
+    if user_id not in users:
+        users[user_id] = {
             "verified": False,
             "partner": None,
             "gender": None,
@@ -52,354 +104,340 @@ def ensure_user(uid: int):
             "banned": False,
         }
 
-def save_profile_backup():
-    # Save only profile info for verified users
-    data = {}
-    for uid, u in users.items():
-        if u.get("verified"):
-            data[str(uid)] = {
-                "id": uid,
-                "name": u.get("name"),
-                "gender": u.get("gender"),
-                "age": u.get("age"),
-                "verified_at": u.get("verified_at"),
-            }
-    with open(BACKUP_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE):
-    # send backup file (JSON only) to admin
-    try:
-        if os.path.exists(BACKUP_FILE):
-            await context.bot.send_document(chat_id=ADMIN_ID, document=InputFile(BACKUP_FILE))
-    except Exception as e:
-        print("Failed to send backup to admin:", e)
+def save_chat(user_id: int, sender: str, message: str):
+    if user_id not in chat_logs:
+        chat_logs[user_id] = []
+    chat_logs[user_id].append((sender, message))
+    if len(chat_logs[user_id]) > 20:
+        chat_logs[user_id] = chat_logs[user_id][-20:]
 
 # ---------------------------
-# Start / registration
+# Helper functions for finding matches (Matchmaking Ganda)
+# ---------------------------
+def find_partner_match(user_id: int) -> Optional[int]:
+    """Finds a verified, searching, non-banned partner of the opposite gender (Cari Doi)."""
+    user_data = users.get(user_id)
+    if not user_data: return None
+
+    user_gender = user_data.get("gender")
+    required_gender = "Perempuan" if user_gender == "Laki-laki" else "Laki-laki" if user_gender == "Perempuan" else None
+    if not required_gender: return find_friend_match(user_id)
+    
+    candidates = [
+        uid for uid, u in users.items()
+        if u.get("searching") and uid != user_id and u.get("verified") and not u.get("banned") and u.get("gender") == required_gender
+    ]
+    if candidates: return random.choice(candidates)
+    return None
+
+def find_friend_match(user_id: int) -> Optional[int]:
+    """Finds a verified, searching, non-banned partner of ANY gender (Find/Cari Teman)."""
+    candidates = [
+        uid for uid, u in users.items()
+        if u.get("searching") and uid != user_id and u.get("verified") and not u.get("banned")
+    ]
+    if candidates: return random.choice(candidates)
+    return None
+
+# ---------------------------
+# Menu / Start / Registration
 # ---------------------------
 async def show_main_menu(update: Optional[Update] = None, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None):
+    now = datetime.now()
+    day = now.weekday()  # Monday=0, ..., Friday=4, Saturday=5, Sunday=6
+    hour = now.hour
+
     keyboard = [
-        [InlineKeyboardButton("🔍 Find", callback_data="find")],
+        [InlineKeyboardButton("🔍 Find (Cari Teman)", callback_data="find")], 
         [InlineKeyboardButton("✏️ Ubah Profil", callback_data="ubah_profil")],
-        [InlineKeyboardButton("👤 Profil", callback_data="profil")],
-        [InlineKeyboardButton("💰 Dukung Operasional", url=SAWERIA_LINK)],
     ]
-    text = "Anon Semarang Bot\nTempat berbagi cerita dan bertemu teman baru secara anonim.\nPilih tombol untuk memulai percakapan:"
+
+    # Insert Cari Doi only Fri 18:00 -> Sun 23:59
+    if (day == 4 and hour >= 18) or (day == 5) or (day == 6): 
+        keyboard.insert(1, [InlineKeyboardButton("💘 Cari Doi (Lawan Jenis)", callback_data="cari_doi")])
+
+    text = "✅ Kamu sudah terverifikasi!\nPilih tombol untuk mulai anonim:"
     markup = InlineKeyboardMarkup(keyboard)
+
     if update and getattr(update, "message", None):
-        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+        await update.message.reply_text(text, reply_markup=markup)
     elif update and getattr(update, "callback_query", None):
-        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(text, reply_markup=markup)
     elif chat_id and context:
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    uid = user.id
-    ensure_user(uid)
-    users[uid].setdefault("name", user.first_name)
+    user_id = update.effective_user.id
+    ensure_user(user_id)
 
-    info = (
-        "👋 Hai! Selamat datang di *Anon Semarang Bot* 🎭\n\n"
-        "Sebelum mulai, silakan verifikasi singkat (gender + umur).\n"
-        "Gunakan bot dengan bijak dan jangan sebarkan data pribadi."
-    )
-    await safe_reply(update, info.format(bot_title="Anon Semarang Bot"), parse_mode="Markdown")
-
-    if users[uid].get("banned"):
+    if users[user_id].get("banned"):
         await safe_reply(update, "⚠️ Kamu telah diblokir admin dan tidak bisa menggunakan bot ini.")
         return ConversationHandler.END
 
-    if users[uid].get("verified"):
-        await show_main_menu(update, context)
+    if users[user_id].get("verified"):
+        if users[user_id].get("searching"):
+            await safe_reply(update, "⏳ Kamu sedang mencari partner...\nGunakan /stop untuk membatalkan.")
+        elif users[user_id].get("partner"):
+            await safe_reply(update, "💬 Kamu sedang dalam percakapan anonim.\nGunakan /stop untuk mengakhiri.")
+        else:
+            await show_main_menu(update, context)
         return ConversationHandler.END
 
+    # Registration starts (TANPA UNIVERSITAS)
     keyboard = [
         [InlineKeyboardButton("Laki-laki", callback_data="male")],
         [InlineKeyboardButton("Perempuan", callback_data="female")],
     ]
-    await safe_reply(update, "🚻 Pilih gender kamu:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return GENDER
+    await safe_reply(update, "👋 Selamat datang di Anonymous Chat!\nPilih gender kamu:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return GENDER # Lanjut ke GENDER, melewati UNIVERSITY
+
 
 async def handle_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    uid = query.from_user.id
-    ensure_user(uid)
-    users[uid]["gender"] = "Laki-laki" if query.data == "male" else "Perempuan"
-    try:
-        await query.edit_message_text("🎂 Masukkan usia kamu (contoh: 21):")
-    except Exception:
-        await safe_reply(update, "🎂 Masukkan usia kamu (contoh: 21):")
+    user_id = query.from_user.id
+    ensure_user(user_id)
+    users[user_id]["gender"] = "Laki-laki" if query.data == "male" else "Perempuan"
+
+    await query.edit_message_text("🎂 Masukkan usia kamu (18–25 tahun):")
     return AGE
 
+
 async def handle_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
+    user_id = update.effective_user.id
+    ensure_user(user_id)
     age_text = update.message.text.strip()
     if not age_text.isdigit():
         await safe_reply(update, "⚠️ Usia harus berupa angka. Coba lagi:")
         return AGE
+
     age = int(age_text)
-    if age < 17 or age > 30:
-        await safe_reply(update, "Maaf, bot ini hanya untuk pengguna usia 17–30 tahun ya 😊")
+    if age < 18 or age > 25:
+        await safe_reply(update, "⚠️ Usia hanya diperbolehkan 18–25 tahun. Coba lagi:")
         return AGE
-    users[uid]["age"] = age
-    users[uid]["verified"] = True
-    users[uid]["searching"] = False
-    users[uid]["verified_at"] = datetime.now().isoformat()
-    users[uid].setdefault("name", context.application.bot.username if hasattr(context.application, 'bot') else None)
 
-    # backup profile-only and send to admin (JSON only)
+    users[user_id]["age"] = age
+    
+    # VERIFIKASI OTOMATIS
+    users[user_id]["verified"] = True
+    users[user_id].setdefault("name", update.effective_user.first_name)
+    
+    # Instant backup (menggantikan admin verification request)
     try:
-        save_profile_backup()
+        context.application.create_task(auto_backup(context))
     except Exception as e:
-        print("Backup save failed:", e)
-    try:
-        context.application.create_task(send_backup_to_admin(context))
-    except Exception:
-        pass
-
-    await safe_reply(update, "✅ Data kamu sudah diverifikasi otomatis!\nSekarang kamu bisa mulai mencari partner anonim 🎭")
+        print(f"Error creating auto_backup task: {e}")
+    
+    await safe_reply(update, "✅ Profil kamu sudah diverifikasi secara otomatis!")
     await show_main_menu(update, context)
     return ConversationHandler.END
 
 # ---------------------------
-# Search / pairing / relay
+# Stop command (termasuk Saweria Link)
 # ---------------------------
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
-    ensure_user(uid)
-    if users[uid].get("banned"):
-        await query.edit_message_text("⚠️ Kamu diblokir admin.")
-        return
-    action = query.data
-    if action == "find":
-        if users[uid].get("partner"):
-            await query.edit_message_text("⚠️ Kamu sedang dalam percakapan. Gunakan /stop untuk keluar.")
-            return
-        if users[uid].get("searching"):
-            total_verified = sum(1 for u in users.values() if u.get("verified") and not u.get("banned"))
-            total_searching = sum(1 for u in users.values() if u.get("searching") and u.get("verified") and not u.get("banned"))
-            teks = f"⏳ Kamu sudah mencari partner.\n\n👥 User terverifikasi: {total_verified}\n🟢 Sedang online/mencari: {total_searching}\n\nGunakan /stop untuk membatalkan."
-            await query.edit_message_text(teks)
-            return
-        candidates = [uid2 for uid2, u in users.items() if u.get("searching") and uid2 != uid and u.get("verified") and not u.get("banned")]
-        if candidates:
-            partner_id = random.choice(candidates)
-            users[uid]["partner"] = partner_id
-            users[partner_id]["partner"] = uid
-            users[uid]["searching"] = False
-            users[partner_id]["searching"] = False
-            try:
-                await context.bot.send_message(uid, "💬 Partner ditemukan! Sekarang kamu bisa ngobrol anonim.")
-                await context.bot.send_message(partner_id, "💬 Partner ditemukan! Sekarang kamu bisa ngobrol anonim.")
-            except Exception:
-                pass
-        else:
-            users[uid]["searching"] = True
-            total_verified = sum(1 for u in users.values() if u.get("verified") and not u.get("banned"))
-            total_searching = sum(1 for u in users.values() if u.get("searching") and u.get("verified") and not u.get("banned"))
-            teks = f"🔍 Sedang mencari partner...\n\n👥 User terverifikasi: {total_verified}\n🟢 Sedang online/mencari: {total_searching}\n\nGunakan /stop untuk membatalkan."
-            await query.edit_message_text(teks)
-    elif action == "ubah_profil":
-        users[uid].update({"verified": False, "gender": None, "age": None})
-        keyboard = [
-            [InlineKeyboardButton("Laki-laki", callback_data="male")],
-            [InlineKeyboardButton("Perempuan", callback_data="female")],
-        ]
-        await query.edit_message_text("✏️ Ubah profil kamu.\nPilih gender:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return GENDER
-    elif action == "profil":
-        await show_profile(update, context)
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    ensure_user(user_id)
+    partner_id = users[user_id].get("partner")
 
-async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    u = users[uid]
-    if u.get("banned"):
-        status = "🚫 Diblokir Admin"
-    elif u.get("partner"):
-        status = f"💬 Sedang ngobrol dengan User {u['partner']}"
-    elif u.get("searching"):
-        status = "🔎 Sedang mencari partner"
-    else:
-        status = "⏸️ Idle"
-    teks = "📝 **Profil Kamu**\n"
-    teks += f"🆔 User ID: `{uid}`\n"
-    teks += f"🚻 Gender: {u.get('gender') or '-'}\n"
-    teks += f"🎂 Usia: {u.get('age') or '-'}\n"
-    teks += f"📌 Status: {status}\n"
-    teks += f"✅ Verifikasi: {'Sudah' if u.get('verified') else 'Belum'}\n"
-    await safe_reply(update, teks, parse_mode="Markdown")
+    if partner_id:
+        try:
+            await context.bot.send_message(chat_id=partner_id, text="❌ Partner keluar dari percakapan.")
+        except: pass
+        users[partner_id]["partner"] = None
+
+    users[user_id]["partner"] = None
+    users[user_id]["searching"] = False
+    
+    await safe_reply(update, "❌ Kamu keluar dari percakapan / pencarian partner.")
+
+    keyboard = [
+        [InlineKeyboardButton("💰 Dukung Kami di Saweria", url=SAWERIA_LINK)]
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+    
+    await safe_reply(update, SAWERIA_MESSAGE, reply_markup=markup)
+
+# ---------------------------
+# Report command (tetap kirim ke admin)
+# ---------------------------
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    ensure_user(user_id)
+    partner_id = users[user_id].get("partner")
+    if not partner_id:
+        await safe_reply(update, "⚠️ Kamu tidak sedang dalam percakapan anonim.")
+        return
+
+    log_text = "📑 Riwayat Chat Terakhir:\n\n"
+    for sender, msg in chat_logs.get(user_id, []):
+        prefix = "🟢 Kamu" if sender == "user" else "🔵 Partner"
+        log_text += f"{prefix}: {msg}\n"
+
+    for admin_id in ADMIN_IDS:
+        keyboard = [[InlineKeyboardButton("🚫 Ban User", callback_data=f"ban_{partner_id}"), InlineKeyboardButton("✅ Unban User", callback_data=f"unban_{partner_id}")]]
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"🚨 LAPORAN USER!\n\nPelapor: {user_id}\nTerlapor: {partner_id}\n\n{log_text}",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        except Exception as e: print(f"ERROR send report to {admin_id}: {e}")
+
+    await safe_reply(update, "📩 Laporan sudah dikirim ke admin. Terima kasih!")
+
+# ---------------------------
+# Admin commands (Broadcast, Ban, Unban)
+# ---------------------------
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if admin_id not in ADMIN_IDS: await safe_reply(update, "❌ Kamu bukan admin."); return
+    if not context.args: await safe_reply(update, "⚠️ Gunakan format: /broadcast <pesan>"); return
+
+    message = " ".join(context.args)
+    target_users = [uid for uid, u in users.items() if not u.get("banned") and uid != admin_id]
+    success_count, fail_count = 0, 0
+    broadcast_message = f"📢 **Pesan Admin**\n\n{message}"
+    
+    for uid in target_users:
+        try:
+            await context.bot.send_message(uid, broadcast_message, parse_mode="Markdown"); success_count += 1
+        except Exception as e: print(f"ERROR broadcasting to {uid}: {e}"); fail_count += 1
+
+    await safe_reply(update, f"✅ Pesan berhasil dikirim ke {success_count} user.\n❌ Gagal dikirim ke {fail_count} user.")
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if admin_id not in ADMIN_IDS: await safe_reply(update, "❌ Kamu bukan admin."); return
+    if not context.args: await safe_reply(update, "⚠️ Gunakan format: /ban <user_id>"); return
+    try: target_id = int(context.args[0])
+    except ValueError: await safe_reply(update, "⚠️ User ID harus berupa angka."); return
+
+    ensure_user(target_id)
+    users[target_id]["banned"] = True
+    await safe_reply(update, f"✅ User {target_id} berhasil diblokir.");
+    try: await context.bot.send_message(target_id, "⚠️ Kamu telah diblokir oleh admin.");
+    except: pass
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if admin_id not in ADMIN_IDS: await safe_reply(update, "❌ Kamu bukan admin."); return
+    if not context.args: await safe_reply(update, "⚠️ Gunakan format: /unban <user_id>"); return
+    try: target_id = int(context.args[0])
+    except ValueError: await safe_reply(update, "⚠️ User ID harus berupa angka."); return
+
+    ensure_user(target_id)
+    users[target_id]["banned"] = False
+    await safe_reply(update, f"✅ User {target_id} sudah di-unban.");
+    try: await context.bot.send_message(target_id, "✅ Kamu sudah di-unban oleh admin.");
+    except: pass
+
+# ---------------------------
+# Admin Panel & Recovery
+# ---------------------------
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if admin_id not in ADMIN_IDS: await safe_reply(update, "❌ Kamu bukan admin."); return
+
+    keyboard = [[InlineKeyboardButton("📋 Semua User", callback_data="list_users")], [InlineKeyboardButton("✅ Terverifikasi", callback_data="list_verified")], [InlineKeyboardButton("🚫 Banned", callback_data="list_banned")]]
+    await safe_reply(update, "⚙️ Panel Admin:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def admin_panel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    action = query.data; admin_id = query.from_user.id
+    if admin_id not in ADMIN_IDS: await query.edit_message_text("❌ Kamu bukan admin."); return
+
+    filter_map = {"list_users": list(users.keys()), "list_verified": [uid for uid, u in users.items() if u.get("verified")], "list_banned": [uid for uid, u in users.items() if u.get("banned")]}
+    
+    if action in filter_map:
+        target_list = filter_map[action]
+        if not target_list:
+            await query.edit_message_text(f"📋 Tidak ada user di kategori ini."); return
+        
+        keyboard = [[InlineKeyboardButton(f"User {uid}", callback_data=f"detail_{uid}")] for uid in target_list]
+        await query.edit_message_text(f"📋 User di Kategori {action.split('_')[1]}:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def admin_detail_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    admin_id = query.from_user.id
+    if admin_id not in ADMIN_IDS: await query.edit_message_text("❌ Kamu bukan admin."); return
+    
+    parts = query.data.split("_", 1)
+    if len(parts) != 2: await query.edit_message_text("⚠️ Data tidak valid."); return
+    try: target_id = int(parts[1])
+    except ValueError: await query.edit_message_text("⚠️ ID user tidak valid."); return
+
+    # Logika Tampilan Profil Admin (DISESUAIKAN, tanpa Universitas)
+    ensure_user(target_id)
+    profil = users[target_id]
+    status_text = "🚫 Diblokir Admin" if profil.get("banned") else f"💬 Ngobrol ({profil['partner']})" if profil.get("partner") else "🔎 Mencari" if profil.get("searching") else "⏸️ Idle"
+
+    teks = f"📝 **Profil User (Detail)**\n🆔 User ID: `{target_id}`\n🚻 Gender: {profil.get('gender') or '-'}\n🎂 Usia: {profil.get('age') or '-'}\n📌 Status: {status_text}\n✅ Verifikasi: {'Sudah' if profil.get('verified') else 'Belum'}\n🚫 Banned: {'Ya' if profil.get('banned') else 'Tidak'}"
+    keyboard = [[InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{target_id}"), InlineKeyboardButton("✅ Unban", callback_data=f"unban_{target_id}")]]
+    await context.bot.send_message(admin_id, teks, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def restore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if admin_id not in ADMIN_IDS: await safe_reply(update, "❌ Kamu bukan admin."); return
+
+    if not getattr(update.message, "document", None): await safe_reply(update, "⚠️ Kirim file JSON backup untuk di-restore."); return
+    doc = update.message.document
+    if doc.file_name != DATA_FILE: await safe_reply(update, f"⚠️ Nama file harus '{DATA_FILE}'."); return
+
+    temp_path = f"temp_recover_{admin_id}.json"
+    try:
+        f = await doc.get_file(); await f.download_to_drive(temp_path)
+        global users, chat_logs
+        with open(temp_path, "r", encoding="utf-8") as fh: recovered_data = json.load(fh)
+        
+        users.clear(); chat_logs.clear()
+        users.update({int(k): v for k, v in recovered_data.get("users", {}).items()})
+        chat_logs.update({int(k): v for k, v in recovered_data.get("chat_logs", {}).items()})
+        os.remove(temp_path)
+        save_data() # Save locally immediately
+        
+        await safe_reply(update, f"✅ Data berhasil di-RECOVER! Total user: {len(users)}.");
+    except json.JSONDecodeError:
+        await safe_reply(update, "❌ Gagal memproses file. Pastikan file JSON valid.")
+    except Exception as e:
+        await safe_reply(update, f"⚠️ Gagal restore: {e}")
 
 # ---------------------------
 # Relay messages
 # ---------------------------
 async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    partner = users[uid].get("partner")
-    if not partner:
+    user_id = update.effective_user.id; ensure_user(user_id)
+    partner_id = users[user_id].get("partner")
+
+    if partner_id:
+        msg = update.message.text
+        if not msg: await safe_reply(update, "⚠️ Maaf, bot hanya mendukung pesan teks saat ngobrol."); return
+        save_chat(user_id, "user", msg); save_chat(partner_id, "partner", msg)
+        try: await context.bot.send_message(chat_id=partner_id, text=msg)
+        except Exception as e: print(f"ERROR sending relayed message: {e}")
+    else:
         await safe_reply(update, "⚠️ Kamu tidak sedang dalam percakapan anonim.")
-        return
-    if not update.message.text:
-        return
-    msg = update.message.text
-    # save chat lightly
-    if uid not in chat_logs:
-        chat_logs[uid] = []
-    chat_logs[uid].append(("user", msg))
-    if len(chat_logs[uid]) > 20:
-        chat_logs[uid] = chat_logs[uid][-20:]
-    # also save for partner
-    if partner not in chat_logs:
-        chat_logs[partner] = []
-    chat_logs[partner].append(("partner", msg))
-    if len(chat_logs[partner]) > 20:
-        chat_logs[partner] = chat_logs[partner][-20:]
-    try:
-        await context.bot.send_message(chat_id=partner, text=msg)
-    except Exception as e:
-        print("Relay error:", e)
 
-# ---------------------------
-# Stop command
-# ---------------------------
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    partner = users[uid].get("partner")
-    if partner:
-        try:
-            await context.bot.send_message(chat_id=partner, text="❌ Partner keluar dari percakapan.")
-        except:
-            pass
-        users[partner]["partner"] = None
-    users[uid]["partner"] = None
-    users[uid]["searching"] = False
-    await safe_reply(update, "❌ Kamu keluar dari percakapan / pencarian partner.")
-
-# ---------------------------
-# Admin commands (ban/unban/broadcast)
-# ---------------------------
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin = update.effective_user.id
-    if admin not in [ADMIN_ID]:
-        await safe_reply(update, "❌ Kamu bukan admin.")
-        return
-    if not context.args:
-        await safe_reply(update, "⚠️ Gunakan: /ban <user_id>")
-        return
-    try:
-        target = int(context.args[0])
-    except ValueError:
-        await safe_reply(update, "⚠️ User ID harus angka.")
-        return
-    ensure_user(target)
-    users[target]["banned"] = True
-    await safe_reply(update, f"✅ User {target} dibanned.")
-    try:
-        await context.bot.send_message(target, "⚠️ Kamu telah diblokir oleh admin.")
-    except:
-        pass
-
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin = update.effective_user.id
-    if admin not in [ADMIN_ID]:
-        await safe_reply(update, "❌ Kamu bukan admin.")
-        return
-    if not context.args:
-        await safe_reply(update, "⚠️ Gunakan: /unban <user_id>")
-        return
-    try:
-        target = int(context.args[0])
-    except ValueError:
-        await safe_reply(update, "⚠️ User ID harus angka.")
-        return
-    ensure_user(target)
-    users[target]["banned"] = False
-    await safe_reply(update, f"✅ User {target} di-unban.")
-    try:
-        await context.bot.send_message(target, "✅ Kamu sudah di-unban oleh admin.")
-    except:
-        pass
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin = update.effective_user.id
-    if admin not in [ADMIN_ID]:
-        await safe_reply(update, "❌ Kamu bukan admin.")
-        return
-    if not context.args:
-        await safe_reply(update, "⚠️ Gunakan: /broadcast <pesan>")
-        return
-    message = " ".join(context.args)
-    sent = 0
-    for uid, u in users.items():
-        if u.get("verified") and not u.get("banned"):
-            try:
-                await context.bot.send_message(chat_id=uid, text=f"📢 Pesan dari Admin:\n\n{message}")
-                sent += 1
-            except:
-                pass
-    await safe_reply(update, f"✅ Broadcast dikirim ke {sent} user.")
-
-# ---------------------------
-# Restore handler (admin upload)
-# ---------------------------
-async def restore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin = update.effective_user.id
-    if admin not in [ADMIN_ID]:
-        await safe_reply(update, "❌ Kamu bukan admin.")
-        return
-    if not getattr(update.message, "document", None):
-        await safe_reply(update, "⚠️ Kirim file JSON backup untuk di-restore.")
-        return
-    doc = update.message.document
-    if not doc.file_name.lower().endswith(".json"):
-        await safe_reply(update, "⚠️ File harus berekstensi .json")
-        return
-    path = "restore_profiles.json"
-    try:
-        f = await doc.get_file()
-        await f.download_to_drive(path)
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        for k, v in data.items():
-            try:
-                ik = int(k)
-            except:
-                ik = k
-            users[ik] = {
-                "verified": True,
-                "partner": None,
-                "gender": v.get("gender"),
-                "age": v.get("age"),
-                "searching": False,
-                "banned": False,
-                "name": v.get("name"),
-                "verified_at": v.get("verified_at"),
-            }
-        save_profile_backup()
-        try:
-            await context.bot.send_document(chat_id=ADMIN_ID, document=InputFile(BACKUP_FILE))
-        except:
-            pass
-        await safe_reply(update, f"✅ Restore selesai. {len(data)} profil dipulihkan.")
-    except Exception as e:
-        await safe_reply(update, f"⚠️ Gagal restore: {e}")
 
 # ---------------------------
 # Main
 # ---------------------------
 def main():
     token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise RuntimeError("BOT_TOKEN environment variable is not set.")
+    if not token: raise RuntimeError("BOT_TOKEN environment variable is not set.")
+
+    load_data() 
     app = ApplicationBuilder().token(token).build()
+
+    # 2. ADD AUTO-BACKUP JOB (Run every 12 hours, and instantly on verification)
+    BACKUP_INTERVAL_SECONDS = 12 * 60 * 60 
+    if app.job_queue:
+        app.job_queue.run_repeating(auto_backup, interval=BACKUP_INTERVAL_SECONDS, first=5) 
+        print(f"🤖 Auto backup scheduled every {BACKUP_INTERVAL_SECONDS / 3600} hours.")
+    else:
+        print("⚠️ WARNING: JobQueue failed to set up. Auto-backup will not run.")
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -413,15 +451,21 @@ def main():
 
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CommandHandler("profil", show_profile))
     app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("report", report))
     app.add_handler(CommandHandler("ban", ban_command))
     app.add_handler(CommandHandler("unban", unban_command))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(MessageHandler(filters.Document.ALL, restore_handler))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("adminpanel", admin_panel))
+    
+    # Handler for Admin Data Recovery
+    app.add_handler(
+        MessageHandler(filters.Document.ALL & filters.User(user_id=ADMIN_IDS), restore_handler)
+    )
+    # Handler for generic text messages (relay)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_message))
 
-    print("🤖 Anon Semarang Bot is running...")
+    print("🤖 Anonymous Chat Final Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
