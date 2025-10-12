@@ -229,7 +229,7 @@ def main():
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("profil", profil))
-    app.add_handler(MessageHandler(filters.Document.JSON, restore_from_file))
+    app.add_handler(MessageHandler(filters.Document.ALL, restore_from_file))
 
     print("🚀 Bot Anon Semarang aktif...")
     app.run_polling()
