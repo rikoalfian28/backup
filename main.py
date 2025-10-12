@@ -1,7 +1,7 @@
 
 import os
-import random
 import json
+import random
 from datetime import datetime
 from typing import Optional
 
@@ -20,11 +20,14 @@ from telegram.ext import (
 GENDER, AGE = range(2)
 
 # === In-memory data (ganti ke DB untuk persisten) ===
-users = {}  # user_id -> dict with keys: verified, partner, domisili_akun, gender, age, searching, banned
+users = {}  # user_id -> dict with keys: verified, partner, gender, age, searching, banned
 chat_logs = {}  # user_id -> list of (sender_label, message) up to last 20
 
 # === Admin IDs ===
 ADMIN_IDS = [7894393728]  # ganti dengan user ID admin-mu
+
+# === Backup file name ===
+BACKUP_FILE = "backup_anon_semarang.json"
 
 # ---------------------------
 # Helper utilities
@@ -35,7 +38,6 @@ async def safe_reply(update: Update, text: str, parse_mode=None, reply_markup=No
         return await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
     elif getattr(update, "callback_query", None):
         cq = update.callback_query
-        # Prefer editing or sending a message in the callback context
         if cq.message:
             return await cq.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
         else:
@@ -68,10 +70,13 @@ def save_chat(user_id: int, sender: str, message: str):
 # Auto-backup & Restore utilities
 # ---------------------------
 def auto_backup_users():
-    """Backup users and chat_logs to backup_anon_semarang.json"""
+    """Backup users and chat_logs to BACKUP_FILE"""
     try:
-        with open("backup_anon_semarang.json", "w", encoding="utf-8") as f:
-            json.dump({"users": users, "chat_logs": chat_logs}, f, indent=2, ensure_ascii=False)
+        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+            # convert keys to strings for JSON safety
+            users_dump = {str(k): v for k, v in users.items()}
+            chat_logs_dump = {str(k): v for k, v in chat_logs.items()}
+            json.dump({"users": users_dump, "chat_logs": chat_logs_dump}, f, indent=2, ensure_ascii=False)
         print(f"✅ Auto-backup berhasil ({len(users)} user tersimpan).")
     except Exception as e:
         print(f"⚠️ Gagal backup data: {e}")
@@ -99,17 +104,25 @@ async def restore_from_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(path)
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # Basic validation
         if not isinstance(data, dict) or ("users" not in data and "chat_logs" not in data):
             await safe_reply(update, "⚠️ Format file tidak valid. Pastikan file backup dibuat oleh bot ini.")
             return
-        # Update structures safely
         if "users" in data and isinstance(data["users"], dict):
             users.clear()
-            users.update(data["users"])
+            for k, v in data["users"].items():
+                try:
+                    ik = int(k)
+                except Exception:
+                    ik = k
+                users[ik] = v
         if "chat_logs" in data and isinstance(data["chat_logs"], dict):
             chat_logs.clear()
-            chat_logs.update(data["chat_logs"])
+            for k, v in data["chat_logs"].items():
+                try:
+                    ik = int(k)
+                except Exception:
+                    ik = k
+                chat_logs[ik] = v
         auto_backup_users()
         await safe_reply(update, f"♻️ Restore berhasil — {len(users)} user dipulihkan.")
     except Exception as e:
@@ -117,13 +130,12 @@ async def restore_from_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------
-# Menu / Start / Registration
+# Menu / Start / Registration (Anon Semarang)
 # ---------------------------
 async def show_main_menu(update: Optional[Update] = None, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None):
     """
     Show main menu.
-    Cari Doi button only shown between:
-      - Saturday >= 18:00 (local server time) up to Sunday 23:59
+    Buttons: Find, Ubah Profil, Profil, Dukung Operasional (Saweria)
     """
     now = datetime.now()
     day = now.weekday()  # Monday=0 .. Sunday=6
@@ -135,57 +147,44 @@ async def show_main_menu(update: Optional[Update] = None, context: Optional[Cont
         [InlineKeyboardButton("👤 Profil", callback_data="profil")],
     ]
 
-    # Insert Cari Doi only Sat 18:00 -> Sun 23:59
+    # Optionally add Cari Doi on weekend
     if (day == 5 and hour >= 18) or (day == 6):
         keyboard.insert(1, [InlineKeyboardButton("💘 Cari Doi", callback_data="cari_doi")])
 
-    # Tambahan tombol Saweria untuk dukungan operasional
+    # Saweria link (unchanged)
     keyboard.append([InlineKeyboardButton("💰 Dukung Operasional", url="https://saweria.co/operasional")])
 
-    text = "✅ Kamu sudah diverifikasi!\nPilih tombol untuk memulai percakapan:"
+    text = "🎭 *Anon Semarang Bot*\nTempat berbagi cerita dan bertemu teman baru secara anonim.\nPilih tombol untuk memulai percakapan:"
     markup = InlineKeyboardMarkup(keyboard)
 
     if update and getattr(update, "message", None):
-        await update.message.reply_text(text, reply_markup=markup)
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     elif update and getattr(update, "callback_query", None):
-        await update.callback_query.edit_message_text(text, reply_markup=markup)
+        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
     elif chat_id and context:
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    ensure_user(user_id)
 
     # --- Informasi & Aturan Penggunaan ---
-    info_text = """👋 Hai! Selamat datang di *Anon Semarang Bot* 🎓
+    info_text = """👋 Hai! Selamat datang di *Anon Semarang Bot* 🎭
 
-Bot ini dibuat untuk *mahasiswa kota Semarang*.
-Mahasiswa dari kampus lain juga dipersilakan menggunakan bot ini,
-namun *diharapkan lebih bijak dalam penggunaannya* dan *tidak menyebarkan informasi pribadi*
-sebelum saling mengenal lebih jauh.
+Bot ini dibuat untuk mahasiswa dan masyarakat di Kota Semarang agar dapat berbicara secara anonim dan aman.
 
-⚠️ *Mohon diperhatikan:*
-• Gunakan bot ini dengan sopan dan bertanggung jawab.
-• Dilarang mengirim konten yang mengandung SARA, pornografi, atau kebencian.
+⚠️ Mohon gunakan dengan bijak:
+• Hormati sesama pengguna.
+• Jangan menyebarkan data pribadi sebelum saling mengenal lebih jauh.
+• Dilarang mengirim konten negatif, SARA, atau pornografi.
 • Pelanggaran akan menyebabkan pemblokiran permanen.
 
-Dengan melanjutkan, kamu dianggap telah membaca dan menyetujui peraturan ini.
-
-Silakan lanjutkan proses verifikasi untuk menggunakan bot. ✅"""
-
+Silakan lanjutkan proses verifikasi singkat untuk mulai menggunakan bot. ✅"""
     try:
         await safe_reply(update, info_text, parse_mode="Markdown")
     except Exception:
-        # ignore send errors
         pass
-
-    is_new = user_id not in users
-    ensure_user(user_id)
-    if is_new:
-        try:
-            auto_backup_users()
-        except Exception:
-            pass
 
     if users[user_id].get("banned"):
         await safe_reply(update, "⚠️ Kamu telah diblokir admin dan tidak bisa menggunakan bot ini.")
@@ -200,14 +199,13 @@ Silakan lanjutkan proses verifikasi untuk menggunakan bot. ✅"""
             await show_main_menu(update, context)
         return ConversationHandler.END
 
-    # not verified -> start registration
+    # Ask gender directly
     keyboard = [
-        [InlineKeyboardButton("Anon Semarang", callback_data="anonsemarang")],
-        [InlineKeyboardButton("Non-Anon Semarang", callback_data="anonsemarang")],
+        [InlineKeyboardButton("Laki-laki", callback_data="male")],
+        [InlineKeyboardButton("Perempuan", callback_data="female")],
     ]
-    await safe_reply(update, "👋 Selamat datang di Anonymous Kampus!\nPilih asal universitas kamu:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return UNIVERSITY
-
+    await safe_reply(update, "🚻 Pilih gender kamu:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return GENDER
 
 
 async def handle_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -217,7 +215,10 @@ async def handle_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(user_id)
     users[user_id]["gender"] = "Laki-laki" if query.data == "male" else "Perempuan"
 
-    await query.edit_message_text("🎂 Masukkan usia kamu (contoh: 21):")
+    try:
+        await query.edit_message_text("🎂 Masukkan usia kamu (contoh: 21):")
+    except Exception:
+        await safe_reply(update, "🎂 Masukkan usia kamu (contoh: 21):")
     return AGE
 
 
@@ -230,13 +231,23 @@ async def handle_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return AGE
 
     age = int(age_text)
-    if age < 18 or age > 25:
-        await safe_reply(update, "⚠️ Usia hanya diperbolehkan 18–25 tahun. Coba lagi:")
+    if age < 17 or age > 30:
+        await safe_reply(update, "Maaf, bot ini hanya untuk pengguna usia 17–30 tahun ya 😊")
         return AGE
 
     users[user_id]["age"] = age
-    await safe_reply(update, "📩 Data kamu sudah dikirim ke admin untuk diverifikasi. Tunggu ya!")
-    await request_admin_verification(user_id, context)
+    users[user_id]["verified"] = True
+    users[user_id]["searching"] = False
+
+    # backup after auto verification
+    try:
+        auto_backup_users()
+    except Exception:
+        pass
+
+    await safe_reply(update, "✅ Data kamu sudah diverifikasi otomatis!\nSekarang kamu bisa mulai mencari partner anonim 🎭")
+    # show main menu
+    await show_main_menu(update, context)
     return ConversationHandler.END
 
 
@@ -259,7 +270,6 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     teks = "📝 **Profil Kamu (Detail)**\n"
     teks += f"🆔 User ID: `{user_id}`\n"
-    teks += ""
     teks += f"🚻 Gender: {profil.get('gender') or '-'}\n"
     teks += f"🎂 Usia: {profil.get('age') or '-'}\n"
     teks += f"📌 Status Aktivitas: {status_text}\n"
@@ -292,16 +302,14 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------
-# Request admin verification (kirim ke semua admin)
+# Request admin verification (kirim ke semua admin) - kept for compatibility but not used
 # ---------------------------
 async def request_admin_verification(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    # ensure user exists
     ensure_user(user_id)
     u = users[user_id]
     text = (
         f"🔔 Permintaan verifikasi baru!\n\n"
         f"👤 User ID: {user_id}\n"
-        ""
         f"🚻 Gender: {u.get('gender')}\n"
         f"🎂 Usia: {u.get('age')}\n\n"
         "✅ Approve atau ❌ Reject?"
@@ -374,7 +382,6 @@ async def show_user_profile(context: ContextTypes.DEFAULT_TYPE, chat_id: int, ta
 
     teks = "📝 **Profil User (Detail)**\n"
     teks += f"🆔 User ID: `{target_id}`\n"
-    teks += ""
     teks += f"🚻 Gender: {profil.get('gender') or '-'}\n"
     teks += f"🎂 Usia: {profil.get('age') or '-'}\n"
     teks += f"📌 Status Aktivitas: {status_text}\n"
@@ -477,7 +484,7 @@ async def admin_detail_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ---------------------------
 # Admin button actions (approve/reject/ban/unban)
-# Note: this handler accepts both verification buttons and ban/unban
+# Note: approve/reject kept but verification is automatic
 # ---------------------------
 async def admin_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -634,8 +641,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             users[user_id]["searching"] = False
             users[partner_id]["searching"] = False
             # notify both
-            await context.bot.send_message(user_id, "💬 Partner ditemukan! Sekarang kamu bisa ngobrol anonim.")
-            await context.bot.send_message(partner_id, "💬 Partner ditemukan! Sekarang kamu bisa ngobrol anonim.")
+            try:
+                await context.bot.send_message(user_id, "💬 Partner ditemukan! Sekarang kamu bisa ngobrol anonim.")
+                await context.bot.send_message(partner_id, "💬 Partner ditemukan! Sekarang kamu bisa ngobrol anonim.")
+            except Exception:
+                pass
         else:
             users[user_id]["searching"] = True
             # stats
@@ -650,14 +660,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(teks)
 
     elif action == "ubah_profil":
-        # reset profile & re-run registration (requires admin re-verify)
-        users[user_id].update({"verified": False,  "gender": None, "age": None})
+        # reset profile & re-run registration (requires re-verification)
+        users[user_id].update({"verified": False, "gender": None, "age": None})
         keyboard = [
-            [InlineKeyboardButton("Anon Semarang", callback_data="anonsemarang")],
-            [InlineKeyboardButton("Non-Anon Semarang", callback_data="anonsemarang")],
+            [InlineKeyboardButton("Laki-laki", callback_data="male")],
+            [InlineKeyboardButton("Perempuan", callback_data="female")],
         ]
-        await query.edit_message_text("✏️ Ubah profil kamu.\nPilih asal universitas:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return UNIVERSITY
+        await query.edit_message_text("✏️ Ubah profil kamu.\nPilih gender:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return GENDER
 
     elif action == "profil":
         await profil(update, context)
@@ -672,6 +682,8 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     partner_id = users[user_id].get("partner")
 
     if partner_id:
+        if not update.message.text:
+            return
         msg = update.message.text
         save_chat(user_id, "user", msg)
         save_chat(partner_id, "partner", msg)
@@ -726,7 +738,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         message = " ".join(context.args)
     else:
-        await safe_reply(update, "📝 Kirim pesan broadcast setelah perintah, contoh:\\n`/broadcast Halo semua!`", parse_mode="Markdown")
+        await safe_reply(update, "📝 Kirim pesan broadcast setelah perintah, contoh:\n`/broadcast Halo semua!`", parse_mode="Markdown")
         return
 
     count = 0
@@ -734,7 +746,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for uid, u in users.items():
         if u.get("verified") and not u.get("banned"):
             try:
-                await context.bot.send_message(chat_id=uid, text=f"📢 *Pesan dari Admin:*\\n\\n{message}", parse_mode="Markdown")
+                await context.bot.send_message(chat_id=uid, text=f"📢 *Pesan dari Admin:*\n\n{message}", parse_mode="Markdown")
                 count += 1
             except Exception as e:
                 failed += 1
@@ -750,20 +762,6 @@ def main():
     TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is not set.")
-
-    # === Restore from backup on startup (jika ada) ===
-    try:
-        if os.path.exists("backup_anon_semarang.json"):
-            with open("backup_anon_semarang.json", "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                if "users" in data and isinstance(data["users"], dict):
-                    users.update(data["users"])
-                if "chat_logs" in data and isinstance(data["chat_logs"], dict):
-                    chat_logs.update(data["chat_logs"])
-            print(f"♻️ Data user dipulihkan dari backup ({len(users)} user).")
-    except Exception as e:
-        print(f"⚠️ Gagal memuat backup: {e}")
 
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -788,10 +786,10 @@ def main():
     app.add_handler(CommandHandler("adminpanel", admin_panel))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("online", online_cmd))
-
-    # Tambahan handler: broadcast dan restore via JSON upload
     app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(MessageHandler(filters.Document.FileExtension("json"), restore_from_file))
+
+    # Restore via JSON upload (admin only)
+    app.add_handler(MessageHandler(filters.Document.ALL, restore_from_file))
 
     # Callback handlers
     app.add_handler(CallbackQueryHandler(admin_action_handler, pattern="^(approve|reject|ban|unban)_"))
