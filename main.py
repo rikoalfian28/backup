@@ -1,11 +1,14 @@
+# -*- coding: utf-8 -*-
+
 import os
 import random
 import json
 from datetime import datetime
 from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
@@ -14,37 +17,40 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.error import Forbidden
 
-# === KONFIGURASI BOT ===
-# GANTI ADMIN_IDS DENGAN USER ID TELEGRAM ANDA
-ADMIN_IDS = [123456789]
-SAWERIA_LINK = "https://saweria.co/YourLink" # Ganti dengan link Saweria Anda
+# === KONFIGURASI UTAMA ===
+# GANTI DENGAN USER ID TELEGRAM ANDA (Bisa lebih dari satu, pisahkan dengan koma)
+ADMIN_IDS = [123456789] 
+# GANTI DENGAN LINK SAWERIA ANDA
+SAWERIA_LINK = "https://saweria.co/YourLink" 
 SAWERIA_MESSAGE = (
     "Terima kasih sudah menggunakan Anonymous Chat! 😊\n\n"
     "Jika bot ini bermanfaat, kamu bisa mendukung operasional server di link berikut:"
 )
 
-# === DATA PERSISTENCE ===
-DATA_FILE = "bot_data.json"
-
-# === STATES UNTUK CONVERSATION HANDLER ===
+# === KONFIGURASI TEKNIS ===
+DATA_FILE = "bot_data_final.json"
+# States untuk alur registrasi
 GENDER, AGE = range(2)
 
 # === PENYIMPANAN DATA SEMENTARA (IN-MEMORY) ===
+# Data ini akan dimuat dari dan disimpan ke DATA_FILE
 users = {}
 chat_logs = {}
-message_map = {} # Untuk fitur reply pesan
+message_map = {}  # Kunci: message_id baru, Value: message_id asli (untuk fitur reply)
 
 # ---------------------------
 # Fungsi Persistence Data (Simpan & Muat)
 # ---------------------------
+
 def save_data():
     """Menyimpan data users dan chat_logs ke file JSON."""
     try:
         data_to_save = {"users": users, "chat_logs": chat_logs}
-        with open(DATA_FILE, "w") as f:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data_to_save, f, indent=4)
-        print(f"🤖 Data saved successfully at {datetime.now().strftime('%H:%M:%S')}")
+        print(f"✅ Data saved successfully at {datetime.now().strftime('%H:%M:%S')}")
     except Exception as e:
         print(f"🔥 ERROR saving data: {e}")
 
@@ -53,16 +59,15 @@ def load_data():
     global users, chat_logs
     if os.path.exists(DATA_FILE):
         try:
-            with open(DATA_FILE, "r") as f:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
                 data_loaded = json.load(f)
-                # Konversi key dari string ke integer
                 users.update({int(k): v for k, v in data_loaded.get("users", {}).items()})
                 chat_logs.update({int(k): v for k, v in data_loaded.get("chat_logs", {}).items()})
-                print(f"🤖 Data loaded from {DATA_FILE}. Total users: {len(users)}")
+                print(f"✅ Data loaded from {DATA_FILE}. Total users: {len(users)}")
         except (json.JSONDecodeError, IOError) as e:
             print(f"⚠️ Error loading data: {e}. Starting fresh.")
     else:
-        print("⚠️ Data file not found. Starting fresh.")
+        print("⚠️ Data file not found. Starting with empty data.")
 
 async def auto_backup(context: ContextTypes.DEFAULT_TYPE):
     """Tugas backup otomatis yang mengirim file data ke admin."""
@@ -72,7 +77,7 @@ async def auto_backup(context: ContextTypes.DEFAULT_TYPE):
             with open(DATA_FILE, 'rb') as f:
                 await context.bot.send_document(
                     chat_id=admin_id, document=f,
-                    caption=f"🗄️ Auto Backup Data ({datetime.now().strftime('%d/%m %H:%M:%S')})"
+                    caption=f"🗄️ Auto Backup Data ({datetime.now().strftime('%d/%m/%Y %H:%M:%S')})"
                 )
         except Exception as e:
             print(f"🔥 ERROR sending backup to admin {admin_id}: {e}")
@@ -80,21 +85,26 @@ async def auto_backup(context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------
 # Fungsi Helper & Utility
 # ---------------------------
+
 def ensure_user(user_id: int):
-    """Memastikan data user ada di dictionary, jika tidak maka dibuatkan."""
+    """Memastikan data default user ada di dictionary."""
     if user_id not in users:
         users[user_id] = {
             "verified": False, "partner": None, "gender": None,
             "age": None, "searching": False, "banned": False,
-            "last_search_mode": "find" # Mode pencarian default
+            "last_search_mode": "find"
         }
 
 async def safe_reply(update: Update, text: str, **kwargs):
     """Mengirim balasan dengan aman, baik dari message atau callback query."""
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, **kwargs)
-    elif update.message:
-        await update.message.reply_text(text, **kwargs)
+    try:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, **kwargs)
+        elif update.message:
+            await update.message.reply_text(text, **kwargs)
+    except Exception as e:
+        print(f"🔥 ERROR in safe_reply: {e}")
+
 
 def find_partner_match(user_id: int) -> Optional[int]:
     """Mencari partner lawan jenis yang sedang mencari."""
@@ -119,10 +129,11 @@ def find_friend_match(user_id: int) -> Optional[int]:
 # ---------------------------
 # Alur Registrasi & Menu Utama
 # ---------------------------
+
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menampilkan menu utama bot."""
     now = datetime.now()
-    day, hour = now.weekday(), now.hour # Senin=0, ..., Minggu=6
+    day, hour = now.weekday(), now.hour  # Senin=0, ..., Minggu=6
     
     keyboard = [
         [InlineKeyboardButton("🔍 Cari Teman (Random)", callback_data="find")],
@@ -177,7 +188,7 @@ async def handle_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     users[user_id]["age"] = int(age_text)
     users[user_id]["verified"] = True
-    save_data() # Langsung simpan data setelah registrasi berhasil
+    save_data()  # Langsung simpan data setelah registrasi berhasil
     await update.message.reply_text("✅ Profil berhasil disimpan!")
     await show_main_menu(update, context)
     return ConversationHandler.END
@@ -185,6 +196,7 @@ async def handle_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------
 # Handler Tombol dan Perintah Chat
 # ---------------------------
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menangani tombol 'Cari Teman' dan 'Cari Doi'."""
     query = update.callback_query
@@ -207,7 +219,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users[user_id].update({"partner": partner_id, "searching": False})
         users[partner_id].update({"partner": user_id, "searching": False})
         
-        chat_msg = f"💬 Partner {search_type_text} ditemukan! Selamat mengobrol.\n\nGunakan /next untuk cari lagi, atau /stop untuk berhenti."
+        chat_msg = (
+            f"💬 Partner {search_type_text} ditemukan! Selamat mengobrol.\n\n"
+            f"➡️ Ketik /next untuk langsung ganti partner.\n"
+            f"➡️ Ketik /stop untuk berhenti dan kembali ke menu."
+        )
         await query.edit_message_text(chat_msg)
         await context.bot.send_message(partner_id, chat_msg)
     else:
@@ -218,34 +234,51 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menghentikan sesi chat atau pencarian."""
     user_id = update.effective_user.id
-    partner_id = users.get(user_id, {}).get("partner")
+    ensure_user(user_id)
+    partner_id = users[user_id].get("partner")
 
     if partner_id:
         try:
             await context.bot.send_message(partner_id, "❌ Partner telah mengakhiri obrolan.")
+        except Forbidden:
+            print(f"⚠️ Partner {partner_id} has blocked the bot.")
         except Exception as e:
             print(f"🔥 Could not notify partner {partner_id}: {e}")
         users[partner_id]["partner"] = None
     
     users[user_id].update({"partner": None, "searching": False})
     
-    await update.message.reply_text("❌ Sesi dihentikan.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Dukung Kami", url=SAWERIA_LINK)]]))
+    await update.message.reply_text(
+        "❌ Sesi dihentikan.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Dukung Kami di Saweria", url=SAWERIA_LINK)]])
+    )
+    # Tampilkan kembali menu utama setelah berhenti
+    await show_main_menu(update, context)
+
 
 async def next_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menghentikan chat saat ini dan langsung mencari partner baru."""
     user_id = update.effective_user.id
-    if not users.get(user_id, {}).get("partner"):
-        await update.message.reply_text("⚠️ Kamu tidak sedang dalam obrolan. Gunakan menu untuk mencari.")
+    ensure_user(user_id)
+    
+    if not users[user_id].get("partner"):
+        await update.message.reply_text("⚠️ Perintah ini hanya bisa digunakan saat sedang dalam obrolan.")
         return
 
     # Hentikan chat lama
-    await stop(update, context)
-    
-    # Cari chat baru
+    partner_id = users[user_id].get("partner")
+    if partner_id:
+        try:
+            await context.bot.send_message(partner_id, "❌ Partner telah mencari obrolan baru. Sesi berakhir.")
+        except Exception as e: print(f"🔥 Error notifying partner on /next: {e}")
+        users[partner_id]["partner"] = None
+    users[user_id]["partner"] = None
+
+    # Cari chat baru secara otomatis
     await update.message.reply_text("🔄 Mencari partner baru...")
     last_mode = users[user_id].get("last_search_mode", "find")
     
-    # Buat callback query palsu untuk memanggil button_handler
+    # Mensimulasikan penekanan tombol untuk menggunakan kembali logika button_handler
     class FakeCallbackQuery:
         def __init__(self, user_id, data):
             self.from_user = type('user', (), {'id': user_id})()
@@ -257,18 +290,23 @@ async def next_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fake_update = type('update', (), {'callback_query': FakeCallbackQuery(user_id, last_mode)})()
     await button_handler(fake_update, context)
 
+
 async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Meneruskan pesan teks antar partner."""
     user_id = update.effective_user.id
-    partner_id = users.get(user_id, {}).get("partner")
+    ensure_user(user_id)
+    partner_id = users[user_id].get("partner")
     if not partner_id:
-        await update.message.reply_text("⚠️ Kamu tidak sedang dalam obrolan.")
+        await update.message.reply_text(
+            "⚠️ Kamu tidak sedang dalam obrolan. Gunakan menu untuk mencari partner.",
+            reply_markup=update.message.reply_markup
+        )
+        await show_main_menu(update, context)
         return
 
     original_message = update.message
-    if not original_message.text: return # Hanya teruskan pesan teks
+    if not original_message.text: return  # Abaikan non-teks
 
-    # Cek apakah ini balasan
     target_reply_id = None
     if original_message.reply_to_message:
         target_reply_id = message_map.get(original_message.reply_to_message.message_id)
@@ -279,63 +317,59 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=original_message.text,
             reply_to_message_id=target_reply_id
         )
-        # Petakan ID pesan untuk fitur reply
         message_map[sent_message.message_id] = original_message.message_id
+    except Forbidden:
+        await update.message.reply_text("❌ Gagal mengirim pesan. Partner telah memblokir bot. Sesi diakhiri.")
+        await stop(update, context)
     except Exception as e:
         print(f"🔥 Failed to relay message to {partner_id}: {e}")
-        await update.message.reply_text("❌ Gagal mengirim pesan. Partner mungkin memblokir bot. Sesi diakhiri.")
-        await stop(update, context)
 
 # ---------------------------
 # Perintah Tambahan
 # ---------------------------
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menampilkan User ID pengguna."""
     await update.message.reply_text(f"🆔 ID Telegram kamu: `{update.effective_user.id}`", parse_mode='Markdown')
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Melaporkan partner saat ini ke admin."""
-    # (Fungsi ini sengaja disederhanakan, Anda bisa menambahkan logika log chat jika perlu)
     user_id = update.effective_user.id
-    partner_id = users.get(user_id, {}).get("partner")
+    ensure_user(user_id)
+    partner_id = users[user_id].get("partner")
     if not partner_id:
         await update.message.reply_text("⚠️ Kamu tidak sedang dalam obrolan untuk dilaporkan.")
         return
 
     report_text = f"🚨 **Laporan Pengguna** 🚨\n\n- **Pelapor:** `{user_id}`\n- **Terlapor:** `{partner_id}`"
-    keyboard = [
-        [InlineKeyboardButton(f"Blokir User {partner_id}", callback_data=f"admin_ban_{partner_id}")],
-    ]
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(admin_id, report_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            await context.bot.send_message(admin_id, report_text, parse_mode='Markdown')
         except Exception as e:
             print(f"🔥 Failed to send report to admin {admin_id}: {e}")
     await update.message.reply_text("✅ Laporan telah dikirim ke admin. Terima kasih.")
 
 
 # ---------------------------
-# Fitur Khusus Admin
-# ---------------------------
-# (Letakkan semua fungsi admin di sini: broadcast, ban, unban, adminpanel, restore_handler, dll.)
-# ... (Kode fungsi admin dari versi sebelumnya bisa disalin di sini) ...
-
-# ---------------------------
 # Fungsi Main
 # ---------------------------
+
 def main():
     """Fungsi utama untuk menjalankan bot."""
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise RuntimeError("Error: BOT_TOKEN environment variable is not set.")
+        raise ValueError("Error: BOT_TOKEN environment variable is not set.")
 
     load_data()
+    
     app = ApplicationBuilder().token(token).build()
 
     # Jadwalkan backup otomatis setiap 6 jam
     if app.job_queue:
         app.job_queue.run_repeating(auto_backup, interval=6 * 3600, first=10)
-        print("🤖 Auto backup job scheduled.")
+        print("✅ Auto backup job scheduled every 6 hours.")
+    else:
+        print("⚠️ JobQueue not available. Auto-backup is disabled.")
 
     # Conversation Handler untuk registrasi dan ubah profil
     conv_handler = ConversationHandler(
@@ -348,6 +382,7 @@ def main():
             AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_age)],
         },
         fallbacks=[CommandHandler("start", start)],
+        per_message=False
     )
     
     app.add_handler(conv_handler)
@@ -361,12 +396,11 @@ def main():
     # Handler untuk tombol menu utama
     app.add_handler(CallbackQueryHandler(button_handler, pattern="^(find|cari_doi)$"))
     
-    # Handler untuk meneruskan pesan (harus terakhir)
+    # Handler untuk meneruskan pesan (harus salah satu yang terakhir)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_message))
 
     print("🚀 Bot is running...")
-    app.run_polling()
-
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
