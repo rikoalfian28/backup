@@ -1,14 +1,10 @@
-# -*- coding: utf-8 -*-
-
 import os
-import random
 import json
-from datetime import datetime
-from typing import Optional
-
+import asyncio
+import redis
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
@@ -19,388 +15,236 @@ from telegram.ext import (
 )
 from telegram.error import Forbidden
 
-# === KONFIGURASI UTAMA ===
-# GANTI DENGAN USER ID TELEGRAM ANDA (Bisa lebih dari satu, pisahkan dengan koma)
-ADMIN_IDS = [123456789] 
-# GANTI DENGAN LINK SAWERIA ANDA
-SAWERIA_LINK = "https://saweria.co/YourLink" 
-SAWERIA_MESSAGE = (
-    "Terima kasih sudah menggunakan Anonymous Chat! 😊\n\n"
-    "Jika bot ini bermanfaat, kamu bisa mendukung operasional server di link berikut:"
-)
+# === KONFIGURASI RAILWAY ===
+app = Flask(__name__)
 
-# === KONFIGURASI TEKNIS ===
-DATA_FILE = "bot_data_final.json"
-# States untuk alur registrasi
+# Ambil Variabel dari Railway
+TOKEN = os.getenv("BOT_TOKEN")
+REDIS_URL = os.getenv("REDIS_URL")
+PUBLIC_URL = os.getenv("PUBLIC_URL") # Domain dari Railway (https://xxx.railway.app)
+
+# Cek koneksi Redis
+if not REDIS_URL:
+    print("⚠️ WARNING: REDIS_URL tidak ditemukan. Bot mungkin error.")
+    r = None
+else:
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+
+# States Conversation
 GENDER, AGE = range(2)
 
-# === PENYIMPANAN DATA SEMENTARA (IN-MEMORY) ===
-# Data ini akan dimuat dari dan disimpan ke DATA_FILE
-users = {}
-chat_logs = {}
-message_map = {}  # Kunci: message_id baru, Value: message_id asli (untuk fitur reply)
+# === DATABASE FUNCTIONS (REDIS) ===
+# Kita pakai Redis agar data aman walaupun server restart
 
-# ---------------------------
-# Fungsi Persistence Data (Simpan & Muat)
-# ---------------------------
+def get_user(user_id):
+    if not r: return {}
+    data = r.get(f"user:{user_id}")
+    return json.loads(data) if data else None
 
-def save_data():
-    """Menyimpan data users dan chat_logs ke file JSON."""
-    try:
-        data_to_save = {"users": users, "chat_logs": chat_logs}
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data_to_save, f, indent=4)
-        print(f"✅ Data saved successfully at {datetime.now().strftime('%H:%M:%S')}")
-    except Exception as e:
-        print(f"🔥 ERROR saving data: {e}")
+def save_user(user_id, data):
+    if r: r.set(f"user:{user_id}", json.dumps(data))
 
-def load_data():
-    """Memuat data dari file JSON saat bot dimulai."""
-    global users, chat_logs
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data_loaded = json.load(f)
-                users.update({int(k): v for k, v in data_loaded.get("users", {}).items()})
-                chat_logs.update({int(k): v for k, v in data_loaded.get("chat_logs", {}).items()})
-                print(f"✅ Data loaded from {DATA_FILE}. Total users: {len(users)}")
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"⚠️ Error loading data: {e}. Starting fresh.")
-    else:
-        print("⚠️ Data file not found. Starting with empty data.")
-
-async def auto_backup(context: ContextTypes.DEFAULT_TYPE):
-    """Tugas backup otomatis yang mengirim file data ke admin."""
-    save_data()
-    for admin_id in ADMIN_IDS:
-        try:
-            with open(DATA_FILE, 'rb') as f:
-                await context.bot.send_document(
-                    chat_id=admin_id, document=f,
-                    caption=f"🗄️ Auto Backup Data ({datetime.now().strftime('%d/%m/%Y %H:%M:%S')})"
-                )
-        except Exception as e:
-            print(f"🔥 ERROR sending backup to admin {admin_id}: {e}")
-
-# ---------------------------
-# Fungsi Helper & Utility
-# ---------------------------
-
-def ensure_user(user_id: int):
-    """Memastikan data default user ada di dictionary."""
-    if user_id not in users:
-        users[user_id] = {
-            "verified": False, "partner": None, "gender": None,
-            "age": None, "searching": False, "banned": False,
-            "last_search_mode": "find"
+def create_user_if_not_exists(user_id):
+    if r and not r.exists(f"user:{user_id}"):
+        default_data = {
+            "verified": False, "partner": None, "gender": None, 
+            "age": None, "searching": False
         }
+        save_user(user_id, default_data)
 
-async def safe_reply(update: Update, text: str, **kwargs):
-    """Mengirim balasan dengan aman, baik dari message atau callback query."""
-    try:
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text, **kwargs)
-        elif update.message:
-            await update.message.reply_text(text, **kwargs)
-    except Exception as e:
-        print(f"🔥 ERROR in safe_reply: {e}")
+# === LOGIKA MATCHMAKING ===
 
-
-def find_partner_match(user_id: int) -> Optional[int]:
-    """Mencari partner lawan jenis yang sedang mencari."""
-    user_gender = users.get(user_id, {}).get("gender")
-    if not user_gender: return None
-    required_gender = "Perempuan" if user_gender == "Laki-laki" else "Laki-laki"
+def find_partner(user_id, mode):
+    if not r: return None
+    user_data = get_user(user_id)
+    my_gender = user_data.get("gender")
     
-    candidates = [
-        uid for uid, u in users.items()
-        if u.get("searching") and uid != user_id and u.get("gender") == required_gender and not u.get("banned")
-    ]
-    return random.choice(candidates) if candidates else None
-
-def find_friend_match(user_id: int) -> Optional[int]:
-    """Mencari partner acak (semua gender) yang sedang mencari."""
-    candidates = [
-        uid for uid, u in users.items()
-        if u.get("searching") and uid != user_id and not u.get("banned")
-    ]
-    return random.choice(candidates) if candidates else None
-
-# ---------------------------
-# Alur Registrasi & Menu Utama
-# ---------------------------
-
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menampilkan menu utama bot."""
-    now = datetime.now()
-    day, hour = now.weekday(), now.hour  # Senin=0, ..., Minggu=6
+    target_queue = "queue:random"
+    if mode == "cari_doi":
+        target_queue = "queue:female" if my_gender == "Laki-laki" else "queue:male"
     
-    keyboard = [
-        [InlineKeyboardButton("🔍 Cari Teman (Random)", callback_data="find")],
-        [InlineKeyboardButton("✏️ Ubah Profil", callback_data="ubah_profil")],
-    ]
-    # Mode Cari Doi hanya aktif Jumat 18:00 - Minggu 23:59
-    if (day == 4 and hour >= 18) or (day == 5) or (day == 6):
-        keyboard.insert(1, [InlineKeyboardButton("💘 Cari Doi (Lawan Jenis)", callback_data="cari_doi")])
+    # Ambil user dari antrean (SPOP = Set Pop / Ambil Acak)
+    partner_id = r.spop(target_queue)
     
-    await safe_reply(update, "✅ Kamu sudah terverifikasi!\nSilakan pilih menu:", reply_markup=InlineKeyboardMarkup(keyboard))
+    # Cegah match dengan diri sendiri
+    if partner_id and int(partner_id) == user_id:
+        partner_id = r.spop(target_queue)
+        
+    return int(partner_id) if partner_id else None
+
+def add_to_queue(user_id, mode):
+    if not r: return
+    user_data = get_user(user_id)
+    if mode == "find":
+        r.sadd("queue:random", user_id)
+    elif mode == "cari_doi":
+        q = "queue:male" if user_data.get("gender") == "Laki-laki" else "queue:female"
+        r.sadd(q, user_id)
+
+def remove_from_queues(user_id):
+    if not r: return
+    r.srem("queue:random", user_id)
+    r.srem("queue:male", user_id)
+    r.srem("queue:female", user_id)
+
+# === HANDLERS ===
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk perintah /start."""
     user_id = update.effective_user.id
-    ensure_user(user_id)
-    if users[user_id].get("banned"):
-        await update.message.reply_text("⚠️ Akun Anda telah diblokir oleh admin.")
+    create_user_if_not_exists(user_id)
+    user = get_user(user_id)
+    
+    if user and user.get("verified"):
+        await show_menu(update)
         return ConversationHandler.END
-    if users[user_id].get("verified"):
-        await show_main_menu(update, context)
-        return ConversationHandler.END
-    return await start_registration_flow(update, context)
-
-async def start_registration_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Memulai alur registrasi atau ubah profil."""
-    if update.callback_query:
-        await update.callback_query.answer()
-    user_id = update.effective_user.id
-    users[user_id].update({"verified": False, "gender": None, "age": None})
-    keyboard = [
-        [InlineKeyboardButton("Laki-laki", callback_data="male")],
-        [InlineKeyboardButton("Perempuan", callback_data="female")],
-    ]
-    await safe_reply(update, "👋 Selamat datang!\nUntuk memulai, pilih gender kamu:", reply_markup=InlineKeyboardMarkup(keyboard))
+        
+    keyboard = [[InlineKeyboardButton("Laki-laki", callback_data="male")],
+                [InlineKeyboardButton("Perempuan", callback_data="female")]]
+    await update.message.reply_text("👋 Selamat datang! Pilih gender:", reply_markup=InlineKeyboardMarkup(keyboard))
     return GENDER
 
+async def show_menu(update: Update):
+    keyboard = [
+        [InlineKeyboardButton("🔍 Cari Teman", callback_data="find")],
+        [InlineKeyboardButton("💘 Cari Doi", callback_data="cari_doi")],
+        [InlineKeyboardButton("✏️ Ubah Profil", callback_data="ubah_profil")]
+    ]
+    text = "✅ Menu Utama:"
+    if update.callback_query:
+        await update.callback_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def handle_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani pilihan gender dan meminta usia."""
-    query = update.callback_query
-    await query.answer()
-    users[query.from_user.id]["gender"] = "Laki-laki" if query.data == "male" else "Perempuan"
-    await query.edit_message_text("🎂 Sekarang, masukkan usiamu (hanya angka, 18-25):")
-    return AGE
-
-async def handle_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani masukan usia dan menyelesaikan registrasi."""
-    user_id = update.effective_user.id
-    age_text = update.message.text.strip()
-    if not age_text.isdigit() or not (18 <= int(age_text) <= 25):
-        await update.message.reply_text("⚠️ Usia tidak valid. Masukkan angka antara 18-25:")
-        return AGE
-
-    users[user_id]["age"] = int(age_text)
-    users[user_id]["verified"] = True
-    save_data()  # Langsung simpan data setelah registrasi berhasil
-    await update.message.reply_text("✅ Profil berhasil disimpan!")
-    await show_main_menu(update, context)
-    return ConversationHandler.END
-
-# ---------------------------
-# Handler Tombol dan Perintah Chat
-# ---------------------------
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani tombol 'Cari Teman' dan 'Cari Doi'."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    ensure_user(user_id)
+    create_user_if_not_exists(user_id)
+    user = get_user(user_id)
+    user["gender"] = "Laki-laki" if query.data == "male" else "Perempuan"
+    save_user(user_id, user)
+    await query.edit_message_text("🎂 Masukkan usia (angka):")
+    return AGE
 
-    if users[user_id].get("partner") or users[user_id].get("searching"):
-        await query.edit_message_text("⚠️ Kamu sudah dalam sesi. Gunakan /stop untuk keluar.")
-        return
+async def handle_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("⚠️ Harus angka.")
+        return AGE
+    user = get_user(user_id)
+    user["age"] = int(text)
+    user["verified"] = True
+    save_user(user_id, user)
+    await update.message.reply_text("✅ Profil disimpan!")
+    await show_menu(update)
+    return ConversationHandler.END
 
-    action = query.data
-    users[user_id]['last_search_mode'] = action
-    partner_finder = find_friend_match if action == "find" else find_partner_match
-    search_type_text = "Cari Teman" if action == "find" else "Cari Doi"
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    create_user_if_not_exists(user_id)
+    
+    mode = query.data
+    if mode == "ubah_profil": return
 
-    partner_id = partner_finder(user_id)
+    partner_id = find_partner(user_id, mode)
     if partner_id:
-        users[partner_id]['last_search_mode'] = action
-        users[user_id].update({"partner": partner_id, "searching": False})
-        users[partner_id].update({"partner": user_id, "searching": False})
+        u1, u2 = get_user(user_id), get_user(partner_id)
+        u1["partner"], u1["searching"] = partner_id, False
+        u2["partner"], u2["searching"] = user_id, False
+        save_user(user_id, u1)
+        save_user(partner_id, u2)
+        remove_from_queues(user_id)
+        remove_from_queues(partner_id)
         
-        chat_msg = (
-            f"💬 Partner {search_type_text} ditemukan! Selamat mengobrol.\n\n"
-            f"➡️ Ketik /next untuk langsung ganti partner.\n"
-            f"➡️ Ketik /stop untuk berhenti dan kembali ke menu."
-        )
-        await query.edit_message_text(chat_msg)
-        await context.bot.send_message(partner_id, chat_msg)
+        msg = "💬 Partner ditemukan! /stop untuk berhenti."
+        await query.edit_message_text(msg)
+        try: await context.bot.send_message(partner_id, msg)
+        except: pass
     else:
-        users[user_id]["searching"] = True
-        total_searching = sum(1 for u in users.values() if u.get("searching"))
-        await query.edit_message_text(f"⏳ Sedang mencari {search_type_text}...\nTotal user mencari: {total_searching}\nGunakan /stop untuk batal.")
-
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menghentikan sesi chat atau pencarian."""
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-    partner_id = users[user_id].get("partner")
-
-    if partner_id:
-        try:
-            await context.bot.send_message(partner_id, "❌ Partner telah mengakhiri obrolan.")
-        except Forbidden:
-            print(f"⚠️ Partner {partner_id} has blocked the bot.")
-        except Exception as e:
-            print(f"🔥 Could not notify partner {partner_id}: {e}")
-        users[partner_id]["partner"] = None
-    
-    users[user_id].update({"partner": None, "searching": False})
-    
-    await update.message.reply_text(
-        "❌ Sesi dihentikan.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Dukung Kami di Saweria", url=SAWERIA_LINK)]])
-    )
-    # Tampilkan kembali menu utama setelah berhenti
-    await show_main_menu(update, context)
-
-
-async def next_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menghentikan chat saat ini dan langsung mencari partner baru."""
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-    
-    if not users[user_id].get("partner"):
-        await update.message.reply_text("⚠️ Perintah ini hanya bisa digunakan saat sedang dalam obrolan.")
-        return
-
-    # Hentikan chat lama
-    partner_id = users[user_id].get("partner")
-    if partner_id:
-        try:
-            await context.bot.send_message(partner_id, "❌ Partner telah mencari obrolan baru. Sesi berakhir.")
-        except Exception as e: print(f"🔥 Error notifying partner on /next: {e}")
-        users[partner_id]["partner"] = None
-    users[user_id]["partner"] = None
-
-    # Cari chat baru secara otomatis
-    await update.message.reply_text("🔄 Mencari partner baru...")
-    last_mode = users[user_id].get("last_search_mode", "find")
-    
-    # Mensimulasikan penekanan tombol untuk menggunakan kembali logika button_handler
-    class FakeCallbackQuery:
-        def __init__(self, user_id, data):
-            self.from_user = type('user', (), {'id': user_id})()
-            self.data = data
-        async def answer(self): pass
-        async def edit_message_text(self, text, **kwargs):
-            await context.bot.send_message(user_id, text, **kwargs)
-
-    fake_update = type('update', (), {'callback_query': FakeCallbackQuery(user_id, last_mode)})()
-    await button_handler(fake_update, context)
-
+        add_to_queue(user_id, mode)
+        u = get_user(user_id)
+        u["searching"] = True
+        save_user(user_id, u)
+        await query.edit_message_text("⏳ Sedang mencari partner...")
 
 async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Meneruskan pesan teks antar partner."""
     user_id = update.effective_user.id
-    ensure_user(user_id)
-    partner_id = users[user_id].get("partner")
-    if not partner_id:
-        await update.message.reply_text(
-            "⚠️ Kamu tidak sedang dalam obrolan. Gunakan menu untuk mencari partner.",
-            reply_markup=update.message.reply_markup
-        )
-        await show_main_menu(update, context)
-        return
-
-    original_message = update.message
-    if not original_message.text: return  # Abaikan non-teks
-
-    target_reply_id = None
-    if original_message.reply_to_message:
-        target_reply_id = message_map.get(original_message.reply_to_message.message_id)
-
-    try:
-        sent_message = await context.bot.send_message(
-            chat_id=partner_id,
-            text=original_message.text,
-            reply_to_message_id=target_reply_id
-        )
-        message_map[sent_message.message_id] = original_message.message_id
-    except Forbidden:
-        await update.message.reply_text("❌ Gagal mengirim pesan. Partner telah memblokir bot. Sesi diakhiri.")
-        await stop(update, context)
-    except Exception as e:
-        print(f"🔥 Failed to relay message to {partner_id}: {e}")
-
-# ---------------------------
-# Perintah Tambahan
-# ---------------------------
-
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menampilkan User ID pengguna."""
-    await update.message.reply_text(f"🆔 ID Telegram kamu: `{update.effective_user.id}`", parse_mode='Markdown')
-
-async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Melaporkan partner saat ini ke admin."""
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-    partner_id = users[user_id].get("partner")
-    if not partner_id:
-        await update.message.reply_text("⚠️ Kamu tidak sedang dalam obrolan untuk dilaporkan.")
-        return
-
-    report_text = f"🚨 **Laporan Pengguna** 🚨\n\n- **Pelapor:** `{user_id}`\n- **Terlapor:** `{partner_id}`"
-    for admin_id in ADMIN_IDS:
+    create_user_if_not_exists(user_id)
+    user = get_user(user_id)
+    partner_id = user.get("partner")
+    
+    if partner_id:
         try:
-            await context.bot.send_message(admin_id, report_text, parse_mode='Markdown')
-        except Exception as e:
-            print(f"🔥 Failed to send report to admin {admin_id}: {e}")
-    await update.message.reply_text("✅ Laporan telah dikirim ke admin. Terima kasih.")
-
-
-# ---------------------------
-# Fungsi Main
-# ---------------------------
-
-def main():
-    """Fungsi utama untuk menjalankan bot."""
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise ValueError("Error: BOT_TOKEN environment variable is not set.")
-
-    load_data()
-    
-    app = ApplicationBuilder().token(token).build()
-
-    # Jadwalkan backup otomatis setiap 6 jam
-    if app.job_queue:
-        app.job_queue.run_repeating(auto_backup, interval=6 * 3600, first=10)
-        print("✅ Auto backup job scheduled every 6 hours.")
+            await context.bot.send_message(partner_id, update.message.text)
+        except:
+            await update.message.reply_text("❌ Partner hilang.")
+            await stop_chat(update, context)
+    elif user.get("searching"):
+        await update.message.reply_text("⏳ Masih mencari...")
     else:
-        print("⚠️ JobQueue not available. Auto-backup is disabled.")
+        await update.message.reply_text("⚠️ Belum ada partner. Klik /start.")
 
-    # Conversation Handler untuk registrasi dan ubah profil
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            CallbackQueryHandler(start_registration_flow, pattern="^ubah_profil$")
-        ],
-        states={
-            GENDER: [CallbackQueryHandler(handle_gender, pattern="^(male|female)$")],
-            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_age)],
-        },
-        fallbacks=[CommandHandler("start", start)],
-        per_message=False
-    )
+async def stop_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    create_user_if_not_exists(user_id)
+    user = get_user(user_id)
+    partner_id = user.get("partner")
     
-    app.add_handler(conv_handler)
+    user["partner"], user["searching"] = None, False
+    save_user(user_id, user)
+    remove_from_queues(user_id)
     
-    # Handler untuk perintah
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("next", next_chat))
-    app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CommandHandler("report", report))
+    if partner_id:
+        p = get_user(partner_id)
+        if p:
+            p["partner"], p["searching"] = None, False
+            save_user(partner_id, p)
+            try: await context.bot.send_message(partner_id, "❌ Chat berakhir.")
+            except: pass
+            
+    await update.message.reply_text("🔴 Sesi berhenti.")
+    await show_menu(update)
 
-    # Handler untuk tombol menu utama
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(find|cari_doi)$"))
-    
-    # Handler untuk meneruskan pesan (harus salah satu yang terakhir)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_message))
+# === SETUP GLOBAL BOT ===
+bot_app = ApplicationBuilder().token(TOKEN).build()
 
-    print("🚀 Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+conv_handler = ConversationHandler(
+    entry_points=[CommandHandler("start", start), CallbackQueryHandler(handle_gender, pattern="^ubah_profil$")],
+    states={GENDER:[CallbackQueryHandler(handle_gender)], AGE:[MessageHandler(filters.TEXT, handle_age)]},
+    fallbacks=[CommandHandler("start", start)]
+)
+bot_app.add_handler(conv_handler)
+bot_app.add_handler(CommandHandler("stop", stop_chat))
+bot_app.add_handler(CallbackQueryHandler(button_handler, pattern="^(find|cari_doi)$"))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_message))
 
-if __name__ == "__main__":
-    main()
+# === FLASK ROUTES ===
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), bot_app.bot)
+        asyncio.run(bot_app.process_update(update))
+        return "OK"
+    return "Webhook Active"
+
+@app.route('/', methods=['GET'])
+def index():
+    # Fitur Auto-Set Webhook saat halaman utama dibuka
+    if not PUBLIC_URL:
+        return "❌ Error: Variable PUBLIC_URL belum di-set di Railway!"
+        
+    webhook_url = f"{PUBLIC_URL}/webhook"
+    try:
+        # Set Webhook ke Telegram
+        asyncio.run(bot_app.bot.set_webhook(webhook_url))
+        return f"✅ Berhasil! Webhook terpasang di: {webhook_url}"
+    except Exception as e:
+        return f"❌ Gagal set webhook: {e}"
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
